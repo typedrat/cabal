@@ -1310,7 +1310,8 @@ hscolourCommand = CommandUI
   , commandSynopsis     =
       "Generate HsColour colourised code, in HTML format."
   , commandDescription  = Just (\_ -> "Requires the hscolour program.\n")
-  , commandNotes        = Nothing
+  , commandNotes        = Just $ \_ ->
+      "Deprecated in favour of 'cabal haddock --hyperlink-source'."
   , commandUsage        = \pname ->
       "Usage: " ++ pname ++ " hscolour [FLAGS]\n"
   , commandDefaultFlags = defaultHscolourFlags
@@ -1598,7 +1599,7 @@ haddockOptions showOrParseArgs =
    haddockCss (\v flags -> flags { haddockCss = v })
    (reqArgFlag "PATH")
 
-  ,option "" ["hyperlink-source","hyperlink-sources"]
+  ,option "" ["hyperlink-source","hyperlink-sources","hyperlinked-source"]
    "Hyperlink the documentation to the source code"
    haddockLinkedSource (\v flags -> flags { haddockLinkedSource = v })
    trueArg
