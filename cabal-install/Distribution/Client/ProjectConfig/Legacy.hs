@@ -1004,7 +1004,7 @@ legacyPackageConfigFieldDescrs =
       [ "hoogle", "html", "html-location"
       , "foreign-libraries"
       , "executables", "tests", "benchmarks", "all", "internal", "css"
-      , "hyperlink-source", "hscolour-css"
+      , "hyperlink-source", "quickjump", "hscolour-css"
       , "contents-location", "keep-temp-files"
       ]
   . commandOptionsToFields
