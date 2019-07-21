@@ -38,9 +38,32 @@ import Distribution.Solver.Types.ConstraintSource
 import Distribution.Client.Types
          ( PackageSpecifier(..), PackageLocation(..), UnresolvedSourcePackage
          , SourcePackageDb(..) )
+
+import Distribution.Compat.Lens
+import qualified Distribution.Types.Lens as L
+
+import Distribution.Types.BuildInfo
+         ( BuildInfo(..), emptyBuildInfo )
+import Distribution.Types.CondTree
+         ( CondTree(..), traverseCondTreeC )
+import Distribution.Types.ExeDependency
+         ( ExeDependency(..) )
+import Distribution.Types.GenericPackageDescription
+         ( GenericPackageDescription(..), emptyGenericPackageDescription )
+import Distribution.Types.Library
+         ( Library(..), emptyLibrary )
+import Distribution.Types.PackageDescription
+         ( PackageDescription(..), emptyPackageDescription )
+import Distribution.PackageDescription.PrettyPrint
+import Distribution.Types.PackageName.Magic
+         ( fakePackageId )
+import qualified Distribution.SPDX.License as SPDX
+import Language.Haskell.Extension
+         ( Language(..) )
+
 import qualified Distribution.Client.InstallPlan as InstallPlan
 import Distribution.Package
-         ( Package(..), PackageName, mkPackageName, unPackageName )
+         ( Dependency(..), Package(..), PackageName, mkPackageName, unPackageName )
 import Distribution.Types.PackageId
          ( PackageIdentifier(..) )
 import Distribution.Client.ProjectConfig.Types
@@ -64,7 +87,7 @@ import Distribution.Solver.Types.PackageIndex
 import Distribution.Types.InstalledPackageInfo
          ( InstalledPackageInfo(..) )
 import Distribution.Types.Version
-         ( nullVersion )
+         ( mkVersion, nullVersion )
 import Distribution.Types.VersionRange
          ( thisVersion )
 import Distribution.Solver.Types.PackageConstraint
@@ -96,7 +119,7 @@ import Distribution.Simple.Configure
          ( configCompilerEx )
 import Distribution.Simple.Compiler
          ( Compiler(..), CompilerId(..), CompilerFlavor(..)
-         , PackageDBStack )
+         , PackageDB(..), PackageDBStack )
 import Distribution.Simple.GHC
          ( ghcPlatformAndVersionString
          , GhcImplInfo(..), getImplInfo
@@ -131,6 +154,7 @@ import Data.Either
 import Data.Ord
          ( comparing, Down(..) )
 import qualified Data.Map as Map
+import qualified Data.Set as Set
 import Distribution.Utils.NubList
          ( fromNubList )
 import System.Directory
@@ -488,12 +512,6 @@ installAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags
       dir </>
       ".ghc.environment." <> ghcPlatformAndVersionString platform compilerVersion
 
-    GhcImplInfo{ supportsPkgEnvFiles } = getImplInfo compiler
-    -- Why? We know what the first part will be, we only care about the packages.
-    filterEnvEntries = filter $ \case
-      GhcEnvFilePackageId _ -> True
-      _                     -> False
-
   envFile <- case flagToMaybe (cinstEnvironmentPath clientInstallFlags) of
     Just spec
       -- Is spec a bare word without any "pathy" content, then it refers to
@@ -510,14 +528,7 @@ installAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags
           else return spec'
     Nothing                       -> return (globalEnv "default")
 
-  envFileExists <- doesFileExist envFile
-  envEntries <- filterEnvEntries <$> if
-    (compilerFlavor == GHC || compilerFlavor == GHCJS)
-      && supportsPkgEnvFiles && envFileExists
-    then catch (readGhcEnvironmentFile envFile) $ \(_ :: ParseErrorExc) ->
-      warn verbosity ("The environment file " ++ envFile ++
-        " is unparsable. Libraries cannot be installed.") >> return []
-    else return []
+  let envEntries = [] 
 
   cabalDir  <- getCabalDir
   mstoreDir <-
@@ -527,10 +538,9 @@ installAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags
     cabalLayout = mkCabalDirLayout cabalDir mstoreDir mlogsDir
     packageDbs  = storePackageDBStack (cabalStoreDirLayout cabalLayout) compilerId
 
-  installedIndex <- getInstalledPackages verbosity compiler packageDbs progDb'
+  installedIndex <- getInstalledPackages verbosity compiler [GlobalPackageDB] progDb'
 
-  let (envSpecs, envEntries') =
-        environmentFileToSpecifiers installedIndex envEntries
+  putStr . showGenericPackageDescription $ initialGlobalPackage installedIndex
 
   -- Second, we need to use a fake project to let Cabal build the
   -- installables correctly. For that, we need a place to put a
@@ -545,7 +555,7 @@ installAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags
                  verbosity
                  config
                  tmpDir
-                 (envSpecs ++ specs)
+                 specs
                  InstallCommand
 
     buildCtx <-
@@ -587,10 +597,8 @@ installAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags
     -- Then, install!
     when (not dryRun) $
       if installLibs
-      then installLibraries verbosity
-           buildCtx compiler packageDbs progDb envFile envEntries'
-      else installExes verbosity
-           baseCtx buildCtx platform compiler clientInstallFlags
+      then installLibraries verbosity compiler packageDbs envFile envEntries
+      else installExes verbosity baseCtx buildCtx platform compiler clientInstallFlags
   where
     configFlags' = disableTestsBenchsByDefault configFlags
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags')
@@ -645,33 +653,20 @@ installExes verbosity baseCtx buildCtx platform compiler
 -- | Install any built library by adding it to the default ghc environment
 installLibraries
   :: Verbosity
-  -> ProjectBuildContext
   -> Compiler
   -> PackageDBStack
-  -> ProgramDb
   -> FilePath -- ^ Environment file
   -> [GhcEnvironmentFileEntry]
   -> IO ()
-installLibraries verbosity buildCtx compiler
-                 packageDbs programDb envFile envEntries = do
+installLibraries verbosity compiler packageDbs envFile envEntries = do
   -- Why do we get it again? If we updated a globalPackage then we need
   -- the new version.
-  installedIndex <- getInstalledPackages verbosity compiler packageDbs programDb
   if supportsPkgEnvFiles $ getImplInfo compiler
     then do
       let
-        getLatest = fmap (head . snd) . take 1 . sortBy (comparing (Down . fst))
-                  . PI.lookupPackageName installedIndex
-        globalLatest = concat (getLatest <$> globalPackages)
-
         baseEntries =
           GhcEnvFileClearPackageDbStack : fmap GhcEnvFilePackageDb packageDbs
-        globalEntries = GhcEnvFilePackageId . installedUnitId <$> globalLatest
-        pkgEntries = ordNub $
-              globalEntries
-          ++ envEntries
-          ++ entriesForLibraryComponents (targetsMap buildCtx)
-        contents' = renderGhcEnvironmentFile (baseEntries ++ pkgEntries)
+        contents' = renderGhcEnvironmentFile (baseEntries ++ envEntries)
       createDirectoryIfMissing True (takeDirectory envFile)
       writeFileAtomic envFile (BS.pack contents')
     else
@@ -697,30 +692,38 @@ warnIfNoExes verbosity buildCtx =
     exeMaybe (ComponentTarget (CExeName exe) _) = Just exe
     exeMaybe _                                  = Nothing
 
-globalPackages :: [PackageName]
-globalPackages = mkPackageName <$>
-  [ "ghc", "hoopl", "bytestring", "unix", "base", "time", "hpc", "filepath"
-  , "process", "array", "integer-gmp", "containers", "ghc-boot", "binary"
-  , "ghc-prim", "ghci", "rts", "terminfo", "transformers", "deepseq"
-  , "ghc-boot-th", "pretty", "template-haskell", "directory", "text"
-  , "bin-package-db"
-  ]
+initialGlobalPackage :: PI.InstalledPackageIndex -> GenericPackageDescription
+initialGlobalPackage ipi = genericPackageDescription
+  where
+    globals = PI.allPackagesByName ipi
 
-environmentFileToSpecifiers
-  :: PI.InstalledPackageIndex -> [GhcEnvironmentFileEntry]
-  -> ([PackageSpecifier a], [GhcEnvironmentFileEntry])
-environmentFileToSpecifiers ipi = foldMap $ \case
-    (GhcEnvFilePackageId unitId)
-        | Just InstalledPackageInfo
-          { sourcePackageId = PackageIdentifier{..}, installedUnitId }
-          <- PI.lookupUnitId ipi unitId
-        , let pkgSpec = NamedPackage pkgName
-                        [PackagePropertyVersion (thisVersion pkgVersion)]
-        -> if pkgName `elem` globalPackages
-          then ([pkgSpec], [])
-          else ([pkgSpec], [GhcEnvFilePackageId installedUnitId])
-    _ -> ([], [])
+    pkgInfoToDep :: InstalledPackageInfo -> Dependency
+    pkgInfoToDep InstalledPackageInfo
+      { sourcePackageId = PackageIdentifier{..}, sourceLibName } =
+        Dependency pkgName (thisVersion pkgVersion) (Set.singleton sourceLibName)
 
+    genericPackageDescription = emptyGenericPackageDescription 
+      & L.packageDescription .~ packageDescription
+      & L.condLibrary        .~ Just (CondNode library globalDeps [])
+    packageDescription = emptyPackageDescription
+      { package = fakePackageId
+      , specVersionRaw = Left (mkVersion [2, 2])
+      , licenseRaw = Left SPDX.NONE
+      }
+    library = emptyLibrary { libBuildInfo = buildInfo }
+    buildInfo = emptyBuildInfo
+      { targetBuildDepends = globalDeps
+      , defaultLanguage = Just Haskell2010
+      }
+    globalDeps = fmap (pkgInfoToDep . head . snd) globals
+
+addDependencies :: GenericPackageDescription 
+                -> [Dependency] -> [ExeDependency]
+                -> GenericPackageDescription
+addDependencies pd libs exes = pd''
+  where
+    pd'  = pd  & (\f -> L.allCondTrees     $ traverseCondTreeC f)    %~ (libs ++)
+    pd'' = pd' & (\f -> L.traverseBuildInfos $ L.buildToolDepends f) %~ (exes ++)
 
 -- | Disables tests and benchmarks if they weren't explicitly enabled.
 disableTestsBenchsByDefault :: ConfigFlags -> ConfigFlags
@@ -804,21 +807,6 @@ installBuiltExe verbosity overwritePolicy
       then removeDirectory destination
       else removeFile      destination
     copy = copyFile source destination >> pure True
-
--- | Create 'GhcEnvironmentFileEntry's for packages with exposed libraries.
-entriesForLibraryComponents :: TargetsMap -> [GhcEnvironmentFileEntry]
-entriesForLibraryComponents = Map.foldrWithKey' (\k v -> mappend (go k v)) []
-  where
-    hasLib :: (ComponentTarget, [TargetSelector]) -> Bool
-    hasLib (ComponentTarget (CLibName _) _, _) = True
-    hasLib _                                   = False
-
-    go :: UnitId
-       -> [(ComponentTarget, [TargetSelector])]
-       -> [GhcEnvironmentFileEntry]
-    go unitId targets
-      | any hasLib targets = [GhcEnvFilePackageId unitId]
-      | otherwise          = []
 
 -- | Create a dummy project context, without a .cabal or a .cabal.project file
 -- (a place where to put a temporary dist directory is still needed)
