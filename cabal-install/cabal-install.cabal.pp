@@ -97,6 +97,7 @@ Version:            3.1.0.0
         Distribution.Client.CmdHaddock
         Distribution.Client.CmdInstall
         Distribution.Client.CmdInstall.ClientInstallFlags
+        Distribution.Client.CmdInstall.InstallTarget
         Distribution.Client.CmdRepl
         Distribution.Client.CmdRun
         Distribution.Client.CmdTest

@@ -28,16 +28,19 @@ import Distribution.Client.CmdErrorMessages
 import Distribution.Client.CmdSdist
 
 import Distribution.Client.CmdInstall.ClientInstallFlags
+import Distribution.Client.CmdInstall.InstallTarget
 
 import Distribution.Client.Setup
          ( GlobalFlags(..), ConfigFlags(..), ConfigExFlags, InstallFlags(..)
          , configureExOptions, haddockOptions, installOptions, testOptions
          , configureOptions, liftOptions )
+import Distribution.Client.GlobalFlags
+         ( RepoContext(..) )
 import Distribution.Solver.Types.ConstraintSource
          ( ConstraintSource(..) )
 import Distribution.Client.Types
          ( PackageSpecifier(..), PackageLocation(..), UnresolvedSourcePackage
-         , SourcePackageDb(..) )
+         , SourcePackageDb(..), Unresolved, isRepoRemote )
 
 import Distribution.Compat.Lens
 import qualified Distribution.Types.Lens as L
@@ -49,11 +52,23 @@ import Distribution.Types.CondTree
 import Distribution.Types.ExeDependency
          ( ExeDependency(..) )
 import Distribution.Types.GenericPackageDescription
-         ( GenericPackageDescription(..), emptyGenericPackageDescription )
+         ( GenericPackageDescription, emptyGenericPackageDescription )
 import Distribution.Types.Library
          ( Library(..), emptyLibrary )
+import Distribution.Types.LibraryVisibility
+         ( LibraryVisibility(..) )
+import Distribution.Types.Executable
+         ( Executable(..) )
+import Distribution.Types.ForeignLib
+         ( ForeignLib(..) )
+import Distribution.Types.TestSuite
+         ( TestSuite(..) )
+import Distribution.Types.Benchmark
+         ( Benchmark(..) )
 import Distribution.Types.PackageDescription
-         ( PackageDescription(..), emptyPackageDescription )
+         ( PackageDescription(..), emptyPackageDescription, allLibraries )
+import Distribution.PackageDescription.Configuration
+         ( flattenPackageDescription )
 import Distribution.PackageDescription.PrettyPrint
 import Distribution.Types.PackageName.Magic
          ( fakePackageId )
@@ -82,10 +97,11 @@ import Distribution.Simple.Program.Find
 import Distribution.Client.Config
          ( getCabalDir, loadConfig, SavedConfig(..) )
 import qualified Distribution.Simple.PackageIndex as PI
+import qualified Distribution.Solver.Types.PackageIndex as SPI
 import Distribution.Solver.Types.PackageIndex
          ( lookupPackageName, searchByName )
 import Distribution.Types.InstalledPackageInfo
-         ( InstalledPackageInfo(..) )
+         ( InstalledPackageInfo( InstalledPackageInfo, sourcePackageId, sourceLibName ) )
 import Distribution.Types.Version
          ( mkVersion, nullVersion )
 import Distribution.Types.VersionRange
@@ -95,7 +111,7 @@ import Distribution.Solver.Types.PackageConstraint
 import Distribution.Client.IndexUtils
          ( getSourcePackages, getInstalledPackages )
 import Distribution.Client.ProjectConfig
-         ( readGlobalConfig, projectConfigWithBuilderRepoContext
+         ( readGlobalConfig, projectConfigWithSolverRepoContext
          , resolveBuildTimeSettings, withProjectOrGlobalConfig )
 import Distribution.Client.ProjectPlanning
          ( storePackageInstallDirs' )
@@ -129,6 +145,8 @@ import Distribution.System
          ( Platform )
 import Distribution.Types.UnitId
          ( UnitId )
+import Distribution.Types.ComponentName
+         ( ComponentName(..), componentNameString )
 import Distribution.Types.UnqualComponentName
          ( UnqualComponentName, unUnqualComponentName, mkUnqualComponentName )
 import Distribution.Verbosity
@@ -141,6 +159,9 @@ import Distribution.Utils.Generic
          ( writeFileAtomic )
 import Distribution.Deprecated.Text
          ( simpleParse )
+import Distribution.Parsec
+import Distribution.Parsec.FieldLineStream 
+         ( fieldLineStreamFromString )
 import Distribution.Pretty
          ( prettyShow )
 
@@ -151,6 +172,8 @@ import Control.Monad
 import qualified Data.ByteString.Lazy.Char8 as BS
 import Data.Either
          ( partitionEithers )
+import Data.Monoid
+         ( First(..) )
 import Data.Ord
          ( comparing, Down(..) )
 import qualified Data.Map as Map
@@ -274,206 +297,108 @@ installAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags
     savedConfig <- loadConfig verbosity configFileFlag
     pure $ savedClientInstallFlags savedConfig `mappend` clientInstallFlags'
 
+  let 
+    argParsec :: String -> Either String ParsedInstallTarget
+    argParsec = either (Left . show) Right
+              . runParsecParser parsec "command"
+              . fieldLineStreamFromString
+
+  rawInstallTargets <- case mapM argParsec targetStrings of
+    Left err      -> die' verbosity err
+    Right targets -> pure targets
+
   let
     installLibs    = fromFlagOrDefault False (cinstInstallLibs clientInstallFlags)
-    targetFilter   = if installLibs then Just LibKind else Just ExeKind
-    targetStrings' = if null targetStrings then ["."] else targetStrings
+    targetFilter   = if installLibs then [LibKind] else [ExeKind]
 
     withProject = do
-      let verbosity' = lessVerbose verbosity
-
-      -- First, we need to learn about what's available to be installed.
-      localBaseCtx <- establishProjectBaseContext verbosity'
-                      cliConfig InstallCommand
-      let localDistDirLayout = distDirLayout localBaseCtx
-      pkgDb <- projectConfigWithBuilderRepoContext verbosity'
-               (buildSettings localBaseCtx) (getSourcePackages verbosity)
-
-      let
-        (targetStrings'', packageIds) =
-          partitionEithers .
-          flip fmap targetStrings' $
-          \str -> case simpleParse str of
-            Just (pkgId :: PackageId)
-              | pkgVersion pkgId /= nullVersion -> Right pkgId
-            _                                   -> Left str
-        packageSpecifiers =
-          flip fmap packageIds $ \case
-          PackageIdentifier{..}
-            | pkgVersion == nullVersion -> NamedPackage pkgName []
-            | otherwise                 -> NamedPackage pkgName
-                                           [PackagePropertyVersion
-                                            (thisVersion pkgVersion)]
-        packageTargets =
-          flip TargetPackageNamed targetFilter . pkgName <$> packageIds
-
-      if null targetStrings'
-        then return (packageSpecifiers, packageTargets, projectConfig localBaseCtx)
-        else do
-          targetSelectors <-
-            either (reportTargetSelectorProblems verbosity) return
-            =<< readTargetSelectors (localPackages localBaseCtx)
-                                    Nothing targetStrings''
-
-          (specs, selectors) <-
-            withInstallPlan verbosity' localBaseCtx $ \elaboratedPlan _ -> do
-            -- Split into known targets and hackage packages.
-            (targets, hackageNames) <- case
-              resolveTargets
-                selectPackageTargets
-                selectComponentTarget
-                TargetProblemCommon
-                elaboratedPlan
-                (Just pkgDb)
-                targetSelectors of
-              Right targets ->
-                -- Everything is a local dependency.
-                return (targets, [])
-              Left errs     -> do
-                -- Not everything is local.
-                let
-                  (errs', hackageNames) = partitionEithers . flip fmap errs $ \case
-                    TargetProblemCommon (TargetAvailableInIndex name) -> Right name
-                    err -> Left err
-
-                -- report incorrect case for known package.
-                for_ errs' $ \case
-                  TargetProblemCommon (TargetNotInProject hn) ->
-                    case searchByName (packageIndex pkgDb) (unPackageName hn) of
-                      [] -> return ()
-                      xs -> die' verbosity . concat $
-                        [ "Unknown package \"", unPackageName hn, "\". "
-                        , "Did you mean any of the following?\n"
-                        , unlines (("- " ++) . unPackageName . fst <$> xs)
-                        ]
-                  _ -> return ()
-
-                when (not . null $ errs') $ reportTargetProblems verbosity errs'
-
-                let
-                  targetSelectors' = flip filter targetSelectors $ \case
-                    TargetComponentUnknown name _ _
-                      | name `elem` hackageNames -> False
-                    TargetPackageNamed name _
-                      | name `elem` hackageNames -> False
-                    _                            -> True
-
-                -- This can't fail, because all of the errors are
-                -- removed (or we've given up).
-                targets <-
-                  either (reportTargetProblems verbosity) return $
-                  resolveTargets
-                    selectPackageTargets
-                    selectComponentTarget
-                    TargetProblemCommon
-                    elaboratedPlan
-                    Nothing
-                    targetSelectors'
-
-                return (targets, hackageNames)
-
-            let
-              planMap = InstallPlan.toMap elaboratedPlan
-              targetIds = Map.keys targets
-
-              sdistize (SpecificSourcePackage spkg@SourcePackage{..}) =
-                SpecificSourcePackage spkg'
-                where
-                  sdistPath = distSdistFile localDistDirLayout packageInfoId
-                  spkg' = spkg { packageSource = LocalTarballPackage sdistPath }
-              sdistize named = named
-
-              local = sdistize <$> localPackages localBaseCtx
-
-              gatherTargets :: UnitId -> TargetSelector
-              gatherTargets targetId = TargetPackageNamed pkgName targetFilter
-                where
-                  Just targetUnit = Map.lookup targetId planMap
-                  PackageIdentifier{..} = packageId targetUnit
-
-              targets' = fmap gatherTargets targetIds
-
-              hackagePkgs :: [PackageSpecifier UnresolvedSourcePackage]
-              hackagePkgs = flip NamedPackage [] <$> hackageNames
-
-              hackageTargets :: [TargetSelector]
-              hackageTargets =
-                flip TargetPackageNamed targetFilter <$> hackageNames
-
-            createDirectoryIfMissing True (distSdistDirectory localDistDirLayout)
-
-            unless (Map.null targets) $
-              mapM_
-                (\(SpecificSourcePackage pkg) -> packageToSdist verbosity
-                  (distProjectRootDirectory localDistDirLayout) TarGzArchive
-                  (distSdistFile localDistDirLayout (packageId pkg)) pkg
-                ) (localPackages localBaseCtx)
-
-            if null targets
-              then return (hackagePkgs, hackageTargets)
-              else return (local ++ hackagePkgs, targets' ++ hackageTargets)
-
-          return ( specs ++ packageSpecifiers
-                 , selectors ++ packageTargets
-                 , projectConfig localBaseCtx )
+      ProjectBaseContext { distDirLayout, cabalDirLayout, projectConfig, localPackages }
+        <- establishProjectBaseContext verbosity cliConfig InstallCommand
+      let projectRoot = distProjectRootDirectory distDirLayout
+      return (projectRoot, cabalDirLayout, projectConfig, localPackages)
 
     withoutProject globalConfig = do
-      let
-        parsePkg pkgName
-          | Just (pkg :: PackageId) <- simpleParse pkgName = return pkg
-          | otherwise = die' verbosity ("Invalid package ID: " ++ pkgName)
-      packageIds <- mapM parsePkg targetStrings'
-
-      cabalDir <- getCabalDir
-      let
+      let 
         projectConfig = globalConfig <> cliConfig
+        fakeProjectRoot = error "cabal panic! Project root is only used when there are local packages!"
+      cabalDirLayout <- getCabalDirLayout projectConfig
+      return (fakeProjectRoot, cabalDirLayout, projectConfig, [])
 
-        ProjectConfigBuildOnly {
-          projectConfigLogsDir
-        } = projectConfigBuildOnly projectConfig
-
-        ProjectConfigShared {
-          projectConfigStoreDir
-        } = projectConfigShared projectConfig
-
-        mlogsDir = flagToMaybe projectConfigLogsDir
-        mstoreDir = flagToMaybe projectConfigStoreDir
-        cabalDirLayout = mkCabalDirLayout cabalDir mstoreDir mlogsDir
-
-        buildSettings = resolveBuildTimeSettings
-                          verbosity cabalDirLayout
-                          projectConfig
-
-      SourcePackageDb { packageIndex } <- projectConfigWithBuilderRepoContext
-                                            verbosity buildSettings
-                                            (getSourcePackages verbosity)
-
-      for_ targetStrings' $ \case
-            name
-              | null (lookupPackageName packageIndex (mkPackageName name))
-              , xs@(_:_) <- searchByName packageIndex name ->
-                die' verbosity . concat $
-                            [ "Unknown package \"", name, "\". "
-                            , "Did you mean any of the following?\n"
-                            , unlines (("- " ++) . unPackageName . fst <$> xs)
-                            ]
-            _ -> return ()
-
-      let
-        packageSpecifiers = flip fmap packageIds $ \case
-          PackageIdentifier{..}
-            | pkgVersion == nullVersion -> NamedPackage pkgName []
-            | otherwise                 -> NamedPackage pkgName
-                                           [PackagePropertyVersion
-                                            (thisVersion pkgVersion)]
-        packageTargets = flip TargetPackageNamed Nothing . pkgName <$> packageIds
-      return (packageSpecifiers, packageTargets, projectConfig)
-
-  (specs, selectors, config) <-
-    withProjectOrGlobalConfig verbosity globalConfigFlag
-                              withProject withoutProject
+  (projectRoot, cabalDirLayout, config, localPackages) <-
+    withProjectOrGlobalConfig verbosity globalConfigFlag withProject withoutProject
 
   home <- getHomeDirectory
+
+  (compiler@Compiler { compilerId =
+    compilerId@(CompilerId _ compilerVersion) }, platform, _) <-
+      getCompiler verbosity config
+
+  let
+    globalEnv name =
+      home </> ".ghc" </> ghcPlatformAndVersionString platform compilerVersion
+           </> "environments" </> name
+    localEnv dir =
+      dir </>
+      ".ghc.environment." <> ghcPlatformAndVersionString platform compilerVersion
+
+  envFile <- case flagToMaybe (cinstEnvironmentPath clientInstallFlags) of
+    Just spec
+      -- Is spec a bare word without any "pathy" content? 
+      -- Then it refers to a named global environment.
+      | takeBaseName spec == spec -> return (globalEnv spec)
+      | otherwise                 -> do
+        spec' <- makeAbsolute spec
+        isDir <- doesDirectoryExist spec'
+        if isDir
+          -- If spec is a directory, then make an ambient environment inside
+          -- that directory.
+          then return (localEnv spec')
+          -- Otherwise, treat it like a literal file path.
+          else return spec'
+    Nothing                       -> return (globalEnv "default")
+
+  print rawInstallTargets
+
+  SourcePackageDb{ packageIndex } <- withRepoContext verbosity config (getSourcePackages verbosity)
+
+  print (resolveInstallTarget targetFilter packageIndex localPackages <$> rawInstallTargets)
+  where
+    configFlags' = disableTestsBenchsByDefault configFlags
+    verbosity = fromFlagOrDefault normal (configVerbosity configFlags')
+    cliConfig = commandLineFlagsToProjectConfig
+                  globalFlags configFlags' configExFlags
+                  installFlags clientInstallFlags'
+                  haddockFlags testFlags
+    globalConfigFlag = projectConfigConfigFile (projectConfigShared cliConfig)
+
+getCabalDirLayout :: ProjectConfig -> IO CabalDirLayout
+getCabalDirLayout projectConfig = do
+  cabalDir <- getCabalDir
+
+  let 
+    ProjectConfigBuildOnly {
+      projectConfigLogsDir
+    } = projectConfigBuildOnly projectConfig
+
+    ProjectConfigShared {
+      projectConfigStoreDir
+    } = projectConfigShared projectConfig
+
+    mstoreDir = flagToMaybe projectConfigStoreDir
+    mlogsDir = flagToMaybe projectConfigLogsDir
+    
+  return (mkCabalDirLayout cabalDir mstoreDir mlogsDir)
+
+
+withRepoContext :: Verbosity -> ProjectConfig -> (RepoContext -> IO a) -> IO a
+withRepoContext verbosity projectConfig f = 
+  projectConfigWithSolverRepoContext verbosity
+    (projectConfigShared projectConfig)
+    (projectConfigBuildOnly projectConfig)
+    f
+
+getCompiler :: Verbosity -> ProjectConfig -> IO (Compiler, Platform, ProgramDb)
+getCompiler verbosity config = do
   let
     ProjectConfig {
       projectConfigShared = ProjectConfigShared {
@@ -499,115 +424,77 @@ installAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags
           (++ [ ProgramSearchPathDir dir
               | dir <- fromNubList packageConfigProgramPathExtra ])
       $ defaultProgramDb
+  
+  configCompilerEx hcFlavor hcPath hcPkg progDb verbosity
 
-  (compiler@Compiler { compilerId =
-    compilerId@(CompilerId compilerFlavor compilerVersion) }, platform, progDb') <-
-      configCompilerEx hcFlavor hcPath hcPkg progDb verbosity
-
-  let
-    globalEnv name =
-      home </> ".ghc" </> ghcPlatformAndVersionString platform compilerVersion
-           </> "environments" </> name
-    localEnv dir =
-      dir </>
-      ".ghc.environment." <> ghcPlatformAndVersionString platform compilerVersion
-
-  envFile <- case flagToMaybe (cinstEnvironmentPath clientInstallFlags) of
-    Just spec
-      -- Is spec a bare word without any "pathy" content, then it refers to
-      -- a named global environment.
-      | takeBaseName spec == spec -> return (globalEnv spec)
-      | otherwise                 -> do
-        spec' <- makeAbsolute spec
-        isDir <- doesDirectoryExist spec'
-        if isDir
-          -- If spec is a directory, then make an ambient environment inside
-          -- that directory.
-          then return (localEnv spec')
-          -- Otherwise, treat it like a literal file path.
-          else return spec'
-    Nothing                       -> return (globalEnv "default")
-
-  let envEntries = [] 
-
-  cabalDir  <- getCabalDir
-  mstoreDir <-
-    sequenceA $ makeAbsolute <$> flagToMaybe (globalStoreDir globalFlags)
-  let
-    mlogsDir    = flagToMaybe (globalLogsDir globalFlags)
-    cabalLayout = mkCabalDirLayout cabalDir mstoreDir mlogsDir
-    packageDbs  = storePackageDBStack (cabalStoreDirLayout cabalLayout) compilerId
-
-  installedIndex <- getInstalledPackages verbosity compiler [GlobalPackageDB] progDb'
-
-  putStr . showGenericPackageDescription $ initialGlobalPackage installedIndex
-
-  -- Second, we need to use a fake project to let Cabal build the
-  -- installables correctly. For that, we need a place to put a
-  -- temporary dist directory.
-  globalTmp <- getTemporaryDirectory
-  withTempDirectory
-    verbosity
-    globalTmp
-    "cabal-install."
-    $ \tmpDir -> do
-    baseCtx <- establishDummyProjectBaseContext
-                 verbosity
-                 config
-                 tmpDir
-                 specs
-                 InstallCommand
-
-    buildCtx <-
-      runProjectPreBuildPhase verbosity baseCtx $ \elaboratedPlan -> do
-
-            -- Interpret the targets on the command line as build targets
-            targets <- either (reportTargetProblems verbosity) return
-                     $ resolveTargets
-                         selectPackageTargets
-                         selectComponentTarget
-                         TargetProblemCommon
-                         elaboratedPlan
-                         Nothing
-                         selectors
-
-            let elaboratedPlan' = pruneInstallPlanToTargets
-                                    TargetActionBuild
-                                    targets
-                                    elaboratedPlan
-            elaboratedPlan'' <-
-              if buildSettingOnlyDeps (buildSettings baseCtx)
-                then either (reportCannotPruneDependencies verbosity) return $
-                     pruneInstallPlanToDependencies (Map.keysSet targets)
-                                                    elaboratedPlan'
-                else return elaboratedPlan'
-
-            return (elaboratedPlan'', targets)
-
-    printPlan verbosity baseCtx buildCtx
-
-    buildOutcomes <- runProjectBuildPhase verbosity baseCtx buildCtx
-    runProjectPostBuildPhase verbosity baseCtx buildCtx buildOutcomes
-
-    -- Now that we built everything we can do the installation part.
-    -- First, figure out if / what parts we want to install:
-    let
-      dryRun = buildSettingDryRun $ buildSettings baseCtx
-
-    -- Then, install!
-    when (not dryRun) $
-      if installLibs
-      then installLibraries verbosity compiler packageDbs envFile envEntries
-      else installExes verbosity baseCtx buildCtx platform compiler clientInstallFlags
+isTargetLocal :: [Unresolved PackageSpecifier] -> InstallTarget a -> Maybe UnresolvedSourcePackage
+isTargetLocal localPackages target = getFirst $ foldMap go localPackages
   where
-    configFlags' = disableTestsBenchsByDefault configFlags
-    verbosity = fromFlagOrDefault normal (configVerbosity configFlags')
-    cliConfig = commandLineFlagsToProjectConfig
-                  globalFlags configFlags' configExFlags
-                  installFlags clientInstallFlags'
-                  haddockFlags testFlags
-    globalConfigFlag = projectConfigConfigFile (projectConfigShared cliConfig)
+    go (SpecificSourcePackage pkg)
+      | packageId pkg == packageId target = First (Just pkg)
+    go _                                  = First Nothing
 
+data InstallTargetResolutionError = TargetPackageNotFound PackageId
+                                  | TargetPackageInPrivateRepo PackageId
+                                  | TargetPackageEmpty PackageId
+                                  | TargetPackageHasNoComponent PackageId ParsedTarget
+                                  | TargetComponentExcludedByFilter PackageId ComponentKind
+                                  | TargetComponentAmbiguous PackageId UnqualComponentName
+                                  deriving (Eq, Show) 
+
+resolveInstallTarget :: [ComponentKind] -> Unresolved SPI.PackageIndex 
+                     -> [Unresolved PackageSpecifier]
+                     -> ParsedInstallTarget
+                     -> Either InstallTargetResolutionError [ResolvedInstallTarget]
+resolveInstallTarget kinds index localPackages target = do
+  let 
+    targetId = packageId target
+    targetComp = itComp target
+  (pkg, wrap) <- case isTargetLocal localPackages target of
+    Just pkg -> return (pkg, Local)
+    Nothing -> case SPI.lookupPackageId index targetId of
+      Just pkg -> return (pkg, Repo)
+      Nothing -> Left (TargetPackageNotFound targetId)
+
+  let 
+    pd = flattenPackageDescription $ packageDescription pkg
+
+    unqualEq n c = maybe False (== n) (componentNameString c)
+
+    libraries = filter ((== LibraryVisibilityPublic) . libVisibility) (allLibraries pd)
+    libNames   = CLibName   . libName        <$> libraries
+    exeNames   = CExeName   . exeName        <$> executables pd
+    flibNames  = CFLibName  . foreignLibName <$> foreignLibs pd
+    testNames  = CTestName  . testName       <$> testSuites pd
+    benchNames = CBenchName . benchmarkName  <$> benchmarks pd
+    allNames = concat [libNames, exeNames, flibNames, testNames, benchNames]
+
+  names <- case targetComp of
+    Just (Unqual n) -> case filter (unqualEq n) allNames of
+      [c]   
+        | componentKind c `elem` kinds -> return [c]
+        | otherwise -> Left (TargetComponentExcludedByFilter targetId $ componentKind c)
+      (_:_) -> Left (TargetComponentAmbiguous targetId n)
+    Just (Qual c)
+      | c `elem` allNames -> if componentKind c `elem` kinds
+        then return [c]
+        else Left (TargetComponentExcludedByFilter targetId $ componentKind c)
+    Just (Filter f)
+      | f `notElem` kinds -> Left (TargetComponentExcludedByFilter targetId f)
+    Just (Filter LibKind)   -> return libNames
+    Just (Filter ExeKind)   -> return exeNames
+    Just (Filter FLibKind)  -> return flibNames
+    Just (Filter TestKind)  -> return testNames
+    Just (Filter BenchKind) -> return benchNames
+    Just comp -> Left (TargetPackageHasNoComponent targetId comp)
+    
+    Nothing
+      | let out = filter (flip elem kinds . componentKind) allNames
+      , not (null out) -> return out
+      | otherwise -> Left (TargetPackageEmpty targetId)
+
+  return (InstallTarget targetId . wrap <$> names)
+  
 -- | Install any built exe by symlinking/copying it
 -- we don't use BuildOutcomes because we also need the component names
 installExes

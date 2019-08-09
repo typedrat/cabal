@@ -77,10 +77,12 @@ import qualified Text.PrettyPrint as Disp
 newtype Username = Username { unUsername :: String }
 newtype Password = Password { unPassword :: String }
 
+type Unresolved f = f UnresolvedSourcePackage
+
 -- | This is the information we get from a @00-index.tar.gz@ hackage index.
 --
 data SourcePackageDb = SourcePackageDb {
-  packageIndex       :: PackageIndex UnresolvedSourcePackage,
+  packageIndex       :: Unresolved PackageIndex,
   packagePreferences :: Map PackageName VersionRange
 }
   deriving (Eq, Generic)

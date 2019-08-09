@@ -578,6 +578,11 @@ resolveTargets selectPackageTargets selectComponentTarget liftProblem
       = fmap (componentTargets subtarget)
       $ selectComponentTargets subtarget ats
 
+      | Just SourcePackageDb{ packageIndex } <- mPkgDb
+      , let pkg = lookupPackageName packageIndex pkgname
+      , not (null pkg)
+      = Left (liftProblem (TargetAvailableInIndex pkgname))
+
       | Map.member pkgname availableTargetsByPackageName
       = Left (liftProblem (TargetProblemUnknownComponent pkgname ecname))
 
