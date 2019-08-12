@@ -165,6 +165,8 @@ import Distribution.Parsec.FieldLineStream
 import Distribution.Pretty
          ( prettyShow )
 
+import qualified Codec.Archive.Tar       as Tar
+import qualified Codec.Archive.Tar.Entry as Tar
 import Control.Exception
          ( catch )
 import Control.Monad
@@ -178,6 +180,7 @@ import Data.Ord
          ( comparing, Down(..) )
 import qualified Data.Map as Map
 import qualified Data.Set as Set
+
 import Distribution.Utils.NubList
          ( fromNubList )
 import System.Directory
@@ -327,11 +330,24 @@ installAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags
   (projectRoot, cabalDirLayout, config, localPackages) <-
     withProjectOrGlobalConfig verbosity globalConfigFlag withProject withoutProject
 
-  home <- getHomeDirectory
+  SourcePackageDb{ packageIndex } <-
+    withRepoContext verbosity config (getSourcePackages verbosity)
 
   (compiler@Compiler { compilerId =
     compilerId@(CompilerId _ compilerVersion) }, platform, _) <-
       getCompiler verbosity config
+
+  unless (null localPackages) $
+    addLocalPackagesToRepo verbosity projectRoot cabalDirLayout localPackages
+
+  let 
+    resolvedTargets = 
+      resolveInstallTarget targetFilter packageIndex localPackages
+      <$> rawInstallTargets
+
+  print resolvedTargets
+
+  home <- getHomeDirectory
 
   let
     globalEnv name =
@@ -356,12 +372,6 @@ installAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags
           -- Otherwise, treat it like a literal file path.
           else return spec'
     Nothing                       -> return (globalEnv "default")
-
-  print rawInstallTargets
-
-  SourcePackageDb{ packageIndex } <- withRepoContext verbosity config (getSourcePackages verbosity)
-
-  print (resolveInstallTarget targetFilter packageIndex localPackages <$> rawInstallTargets)
   where
     configFlags' = disableTestsBenchsByDefault configFlags
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags')
@@ -370,6 +380,31 @@ installAction (configFlags, configExFlags, installFlags, haddockFlags, testFlags
                   installFlags clientInstallFlags'
                   haddockFlags testFlags
     globalConfigFlag = projectConfigConfigFile (projectConfigShared cliConfig)
+
+addLocalPackagesToRepo :: Verbosity -> FilePath -> CompilerId 
+                       -> CabalDirLayout -> [Unresolved PackageSpecifier]
+                       -> IO ()
+addLocalPackagesToRepo verbosity rootDir compilerId 
+                       (CabalDirLayout { cabalWorldDir }) = mapM_ go
+  where
+    go (SpecificSourcePackage pkg) = do
+      let 
+        out                    = worldLocalRepoPackageFile cabalWorldDir 
+                                   compilerId (packageId pkg)
+        archivePath            = worldLocalRepoIndexFile cabalWorldDir compilerId
+        archiveCabalPath       = worldLocalRepoIndexPackage (packageId pkg)
+        PackageIdentifier {..} = packageId pkg
+
+        hasEntryWithPath tarPath tarEntry = Tar.entryTarPath tarEntry == tarPath
+
+      packageToSdist verbosity rootDir TarGzArchive out
+
+      archive <- Tar.read =<< BS.readFile archivePath
+      
+
+    go (NamedPackage {}) = return ()
+
+
 
 getCabalDirLayout :: ProjectConfig -> IO CabalDirLayout
 getCabalDirLayout projectConfig = do

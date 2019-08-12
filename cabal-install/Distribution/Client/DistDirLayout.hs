@@ -35,6 +35,7 @@ import Distribution.Pretty
          ( prettyShow )
 import Distribution.Types.ComponentName
 import Distribution.Types.LibraryName
+import Distribution.Types.PackageId
 import Distribution.System
 
 
@@ -135,6 +136,14 @@ data StoreDirLayout = StoreDirLayout {
        storeIncomingLock      :: CompilerId -> UnitId -> FilePath
      }
 
+data WorldDirLayout = WorldDirLayout {
+    worldDirectory :: CompilerId -> FilePath
+  , worldPackageFile :: CompilerId -> FilePath
+  , worldLocalRepo :: CompilerId -> FilePath
+  , worldLocalRepoPackageFile :: CompilerId -> PackageId -> FilePath
+  , worldLocalRepoIndexFile :: CompilerId -> FilePath
+  , worldLocalRepoIndexPackage :: PackageId -> FilePath
+  }
 
 --TODO: move to another module, e.g. CabalDirLayout?
 -- or perhaps rename this module to DirLayouts.
@@ -147,9 +156,8 @@ data StoreDirLayout = StoreDirLayout {
 --
 data CabalDirLayout = CabalDirLayout {
        cabalStoreDirLayout        :: StoreDirLayout,
-
        cabalLogsDirectory         :: FilePath,
-       cabalWorldFile             :: FilePath
+       cabalWorldDirLayout        :: WorldDirLayout
      }
 
 
@@ -263,6 +271,30 @@ defaultStoreDirLayout storeRoot =
       storeIncomingDirectory compid </> display unitid <.> "lock"
 
 
+defaultWorldDirLayout :: FilePath -> WorldDirLayout
+defaultWorldDirLayout worldRoot = WorldDirLayout {..}
+  where
+    worldDirectory compId =
+      worldRoot </> display compId
+
+    worldPackageFile compId =
+      worldDirectory compId </> "world.cabal"
+    
+    worldLocalRepo compId =
+      worldDirectory compId </> "repo"
+    
+    worldLocalRepoPackageFile compId pkgId@PackageIdentifier{..} =
+          worldLocalRepo compId </> prettyShow pkgName </> prettyShow pkgVersion
+      </> display pkgId <.> "tar.gz"
+
+    worldLocalRepoIndexFile compId =
+      worldLocalRepo compId </> "00-index.tar"
+
+    worldLocalRepoIndexPackage PackageIdentifier{..} =
+          prettyShow pkgName </> prettyShow pkgVersion 
+      </> prettyShow pkgName <.> "cabal"
+
+
 defaultCabalDirLayout :: FilePath -> CabalDirLayout
 defaultCabalDirLayout cabalDir =
     mkCabalDirLayout cabalDir Nothing Nothing
@@ -277,4 +309,4 @@ mkCabalDirLayout cabalDir mstoreDir mlogDir =
     cabalStoreDirLayout =
         defaultStoreDirLayout (fromMaybe (cabalDir </> "store") mstoreDir)
     cabalLogsDirectory = fromMaybe (cabalDir </> "logs") mlogDir
-    cabalWorldFile = cabalDir </> "world"
+    cabalWorldDir = defaultWorldDirLayout (cabalDir </> "world")
